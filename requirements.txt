@@ -1,0 +1,7 @@
+﻿streamlit
+python-docx
+reportlab
+arabic-reshaper
+python-bidi
+pillow
+pytesseract
