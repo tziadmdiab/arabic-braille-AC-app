@@ -1,0 +1,33 @@
+﻿# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3F,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'Akademiat Al-Mawhiba / أكاديمية الموهبة المشتركة'),
+            StringStruct('FileDescription', 'نرى معًا ونقرأ — محوّل عربي ↔ بريل'),
+            StringStruct('FileVersion', '1.0.0'),
+            StringStruct('InternalName', 'NaraMa3an'),
+            StringStruct('OriginalFilename', 'NaraMa3an.exe'),
+            StringStruct('ProductName', 'نرى معًا ونقرأ'),
+            StringStruct('ProductVersion', '1.0.0'),
+            StringStruct('LegalCopyright', '© 2026')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
