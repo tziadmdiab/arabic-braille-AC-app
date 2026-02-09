@@ -5,3 +5,4 @@ arabic-reshaper
 python-bidi
 pillow
 pytesseract
+git push -u origin main
