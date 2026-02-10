@@ -4,6 +4,13 @@ import io
 from typing import Tuple
 
 import streamlit as st
+# =========================
+# App metadata
+# =========================
+APP_NAME = "محوّل عربي ↔ بريل"
+APP_COMPANY = "أكاديمية الموهبة المشتركة"
+APP_VERSION = "1.2.0"
+st.caption(f"الجهة: {APP_COMPANY} — الإصدار {APP_VERSION}")
 
 # Optional: PDF text extraction / OCR
 try:
