@@ -418,5 +418,4 @@ with c5:
     )
 
 st.markdown("---")
-st.caption(f"الجهة: {APP_COMPANY} — الإصدار {APP_VERSION}")
-# update
+st.caption(f"الجهة: {APP_COMPANY} — الإصدار {APP_VERSION}"),
