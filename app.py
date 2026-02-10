@@ -11,7 +11,7 @@ import streamlit as st
 # =========================
 APP_NAME = "محوّل عربي ↔ بريل"
 APP_COMPANY = "أكاديمية الموهبة المشتركة"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # =========================
 # Optional libraries
@@ -66,20 +66,13 @@ except Exception:
 TASHKEEL_RE = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670\u0653-\u0655]")
 
 def normalize_newlines(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
 
 def remove_tashkeel(text: str) -> str:
-    return re.sub(TASHKEEL_RE, "", text)
-
-def safe_len(s: str) -> int:
-    return len(s or "")
-
-def short_preview(s: str, n: int = 200) -> str:
-    s = (s or "").strip()
-    return s[:n] + ("…" if len(s) > n else "")
+    return re.sub(TASHKEEL_RE, "", text or "")
 
 def file_hash(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()[:12]
+    return hashlib.sha256(b or b"").hexdigest()
 
 # =========================
 # Arabic <-> Braille maps
@@ -152,7 +145,7 @@ EXTRA_BR2AR = {
 ALEF_FORMS = {"ا","أ","إ","آ"}
 
 def normalize_digits_to_latin(text: str) -> str:
-    return "".join(ARABIC_DIGITS_TO_LATIN.get(ch, ch) for ch in text)
+    return "".join(ARABIC_DIGITS_TO_LATIN.get(ch, ch) for ch in (text or ""))
 
 # =========================
 # Conversion
@@ -236,7 +229,7 @@ def braille_to_arabic(braille_text: str, arabic_digits: bool = True) -> str:
 # =========================
 def pdf_text_with_pypdf(pdf_bytes: bytes) -> str:
     if PdfReader is None:
-        raise RuntimeError("مكتبة pypdf غير مثبتة.")
+        raise RuntimeError("pypdf غير مثبت.")
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = []
     for p in reader.pages:
@@ -251,18 +244,54 @@ def ocr_image_bytes(image_bytes: bytes, lang: str = "ara") -> str:
 
 def pdf_ocr_with_pymupdf(pdf_bytes: bytes, lang: str = "ara", max_pages: int = 10) -> str:
     if fitz is None:
-        raise RuntimeError("PyMuPDF غير مثبت. أضف PyMuPDF إلى requirements.txt")
+        raise RuntimeError("PyMuPDF غير مثبت.")
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     texts = []
     n = min(len(doc), max_pages)
     for i in range(n):
         page = doc[i]
-        pix = page.get_pixmap(dpi=200)
+        pix = page.get_pixmap(dpi=220)
         img_bytes = pix.tobytes("png")
         t = ocr_image_bytes(img_bytes, lang=lang)
         if t:
             texts.append(t)
     return "\n\n".join(texts).strip()
+
+def extract_text_from_file(name: str, data: bytes, ocr_lang: str, pdf_pages: int) -> tuple[str, str]:
+    name_l = (name or "").lower()
+
+    if name_l.endswith(".txt"):
+        try:
+            t = normalize_newlines(data.decode("utf-8", errors="replace")).strip()
+            return t, f"TXT ({len(t)} حرف)"
+        except Exception as e:
+            return "", f"TXT فشل: {e}"
+
+    if name_l.endswith((".png", ".jpg", ".jpeg")):
+        try:
+            t = ocr_image_bytes(data, lang=ocr_lang)
+            return t, f"صورة OCR ({len(t)} حرف)"
+        except Exception as e:
+            return "", f"OCR فشل: {e}"
+
+    if name_l.endswith(".pdf"):
+        # 1) try text
+        try:
+            t = pdf_text_with_pypdf(data)
+            if t.strip():
+                return t, f"PDF نصي ({len(t)} حرف)"
+        except Exception:
+            pass
+        # 2) OCR
+        try:
+            t2 = pdf_ocr_with_pymupdf(data, lang=ocr_lang, max_pages=pdf_pages)
+            if t2.strip():
+                return t2, f"PDF OCR ({len(t2)} حرف)"
+            return "", "PDF OCR: لم يرجع نصًا"
+        except Exception as e:
+            return "", f"PDF OCR فشل: {e}"
+
+    return "", "نوع ملف غير مدعوم"
 
 # =========================
 # Export
@@ -305,7 +334,6 @@ def export_to_pdf_bytes(text: str, assume_arabic: bool = True) -> bytes:
                 pass
 
     c.setFont(font_name, 12)
-
     for line in normalize_newlines(text).split("\n"):
         if y < margin:
             c.showPage()
@@ -314,21 +342,22 @@ def export_to_pdf_bytes(text: str, assume_arabic: bool = True) -> bytes:
         draw_line = _shape_arabic(line) if assume_arabic else line
         c.drawString(margin, y, draw_line)
         y -= 18
-
     c.save()
     return buf.getvalue()
 
 # =========================
-# UI
+# Streamlit UI
 # =========================
 st.set_page_config(page_title=APP_NAME, layout="wide")
 
-# session state
-st.session_state.setdefault("in_text", "")
-st.session_state.setdefault("out_text", "")
-st.session_state.setdefault("uploaded_name", "")
-st.session_state.setdefault("uploaded_bytes", b"")
-st.session_state.setdefault("uploaded_hash", "")
+# keys for widgets
+IN_KEY = "in_text_area"
+OUT_KEY = "out_text_area"
+
+# defaults
+st.session_state.setdefault(IN_KEY, "")
+st.session_state.setdefault(OUT_KEY, "")
+st.session_state.setdefault("last_upload_hash", "")
 
 st.title(APP_NAME)
 st.caption(f"الجهة: {APP_COMPANY} — الإصدار {APP_VERSION}")
@@ -340,125 +369,60 @@ with st.sidebar:
     arabic_digits_out = st.checkbox("عند (بريل → عربي) استخدم الأرقام العربية ٠١٢٣…", value=True, key="arabic_digits_out")
 
     st.divider()
-    st.subheader("رفع ملف")
     uploaded = st.file_uploader(
-        "ارفع TXT أو PDF أو صورة",
+        "رفع ملف (TXT / PDF / صورة)",
         type=["txt", "pdf", "png", "jpg", "jpeg"],
         key="uploader_main",
     )
 
-    st.subheader("خيارات الاستخراج")
+    st.subheader("خيارات PDF/OCR")
     ocr_lang = st.selectbox("لغة OCR", ["ara", "eng"], index=0, key="ocr_lang")
-    pdf_ocr_pages = st.slider("عدد صفحات OCR (للـ PDF الممسوح)", 1, 30, 10, key="pdf_ocr_pages")
-    auto_convert = st.checkbox("تحويل تلقائي بعد الاستخراج", value=True, key="auto_convert")
-
-    st.divider()
-    st.subheader("تشخيص سريع")
-    st.write(f"أحرف النص الأصلي الآن: **{safe_len(st.session_state.in_text)}**")
-    st.write(f"أحرف الناتج الآن: **{safe_len(st.session_state.out_text)}**")
-    if st.session_state.uploaded_name:
-        st.write(f"آخر ملف: **{st.session_state.uploaded_name}**")
-        st.write(f"Hash: `{st.session_state.uploaded_hash}`")
+    pdf_pages = st.slider("عدد صفحات OCR للـ PDF الممسوح", 1, 30, 10, key="pdf_pages")
+    auto_convert = st.checkbox("تحويل تلقائي بعد الرفع", value=True, key="auto_convert")
 
 def do_convert(src: str) -> str:
     if direction == "عربي → بريل":
         return arabic_to_braille(src, keep_tashkeel=keep_tashkeel)
     return braille_to_arabic(src, arabic_digits=arabic_digits_out)
 
-def extract_from_uploaded(name: str, data: bytes, ocr_lang_: str, max_pages: int) -> tuple[str, str]:
-    name_l = (name or "").lower()
-
-    if name_l.endswith(".txt"):
-        try:
-            t = normalize_newlines(data.decode("utf-8", errors="replace")).strip()
-            return t, f"TXT: تم قراءة {len(t)} حرف."
-        except Exception as e:
-            return "", f"TXT: فشل القراءة: {e}"
-
-    if name_l.endswith((".png", ".jpg", ".jpeg")):
-        try:
-            t = ocr_image_bytes(data, lang=ocr_lang_)
-            return t, f"صورة OCR: تم استخراج {len(t)} حرف."
-        except Exception as e:
-            return "", f"صورة OCR: فشل: {e}"
-
-    if name_l.endswith(".pdf"):
-        # 1) Try text extraction
-        try:
-            t = pdf_text_with_pypdf(data)
-            if t.strip():
-                return t, f"PDF نصي: تم استخراج {len(t)} حرف."
-        except Exception as e:
-            # نكمل نحو OCR
-            pass
-
-        # 2) OCR scanned PDF
-        try:
-            t2 = pdf_ocr_with_pymupdf(data, lang=ocr_lang_, max_pages=max_pages)
-            if t2.strip():
-                return t2, f"PDF ممسوح OCR: تم استخراج {len(t2)} حرف من {max_pages} صفحات."
-            return "", "PDF ممسوح OCR: لم يرجع نصًا (قد تكون جودة المسح ضعيفة)."
-        except Exception as e:
-            return "", f"PDF: فشل OCR: {e}"
-
-    return "", "نوع ملف غير مدعوم."
-
-# 1) عند رفع ملف: خزّنه في session_state (بدون محاولة استخراج تلقائيًا هنا)
+# ✅ استخراج تلقائي فور الرفع + تعبئة مربع النص مباشرة
 if uploaded is not None:
     name = uploaded.name or ""
     data = uploaded.getvalue() or b""
     h = file_hash(data)
 
-    # إذا ملف جديد فعلاً
-    if h != st.session_state.uploaded_hash:
-        st.session_state.uploaded_name = name
-        st.session_state.uploaded_bytes = data
-        st.session_state.uploaded_hash = h
-        st.sidebar.success(f"تم استلام الملف: {name}")
-
-# 2) زر استخراج واضح
-with st.sidebar:
-    if st.button("استخراج النص من الملف ووضعه في مربع النص", use_container_width=True, key="btn_extract"):
-        if not st.session_state.uploaded_bytes:
-            st.sidebar.warning("لم يتم رفع ملف بعد.")
+    # فقط إذا الملف جديد (عشان لا يعيد الاستخراج كل rerun)
+    if h != st.session_state["last_upload_hash"]:
+        text, note = extract_text_from_file(name, data, ocr_lang, pdf_pages)
+        if text.strip():
+            st.session_state[IN_KEY] = text
+            if auto_convert:
+                st.session_state[OUT_KEY] = do_convert(text)
+            st.sidebar.success(f"تمت القراءة: {note}")
         else:
-            text, note = extract_from_uploaded(
-                st.session_state.uploaded_name,
-                st.session_state.uploaded_bytes,
-                ocr_lang,
-                pdf_ocr_pages,
-            )
-            if text.strip():
-                st.session_state.in_text = text
-                st.sidebar.success(note)
-                st.sidebar.write("معاينة:")
-                st.sidebar.code(short_preview(text, 250))
-                if auto_convert:
-                    st.session_state.out_text = do_convert(st.session_state.in_text)
-            else:
-                st.sidebar.error(note)
+            st.sidebar.error(f"فشل استخراج النص: {note}")
+
+        st.session_state["last_upload_hash"] = h
 
 # ===== Main UI =====
 col1, col2 = st.columns(2, gap="large")
 
 with col1:
     st.subheader("النص الأصلي")
-    st.session_state.in_text = st.text_area(
-        "in_text",
-        st.session_state.in_text,
+    st.text_area(
+        label="النص الأصلي",
+        key=IN_KEY,
         height=420,
-        key="in_text_area",
         label_visibility="collapsed",
-        placeholder="ارفع ملف ثم اضغط: (استخراج النص من الملف)... أو اكتب هنا يدويًا",
+        placeholder="ارفع ملف ليتم إدخال النص هنا تلقائيًا… أو اكتب/الصق النص يدويًا",
     )
 
 with col2:
     st.subheader("الناتج")
-    st.session_state.out_text = st.text_area(
-        "out_text",
-        st.session_state.out_text,
+    st.text_area(
+        label="الناتج",
+        key=OUT_KEY,
         height=420,
-        key="out_text_area",
         label_visibility="collapsed",
         placeholder="سيظهر الناتج هنا بعد التحويل",
     )
@@ -467,22 +431,22 @@ b1, b2, b3, b4 = st.columns([1, 1, 1, 1], gap="small")
 
 with b1:
     if st.button("تحويل الآن", use_container_width=True, key="btn_convert"):
-        st.session_state.out_text = do_convert(st.session_state.in_text)
+        st.session_state[OUT_KEY] = do_convert(st.session_state[IN_KEY])
 
 with b2:
     if st.button("تبديل (Swap)", use_container_width=True, key="btn_swap"):
-        st.session_state.in_text, st.session_state.out_text = st.session_state.out_text, st.session_state.in_text
+        st.session_state[IN_KEY], st.session_state[OUT_KEY] = st.session_state[OUT_KEY], st.session_state[IN_KEY]
 
 with b3:
     if st.button("مسح الكل", use_container_width=True, key="btn_clear"):
-        st.session_state.in_text = ""
-        st.session_state.out_text = ""
+        st.session_state[IN_KEY] = ""
+        st.session_state[OUT_KEY] = ""
 
 with b4:
     now = datetime.now().strftime("%Y%m%d-%H%M%S")
     st.download_button(
-        "تحميل الناتج TXT",
-        data=st.session_state.out_text.encode("utf-8"),
+        "تحميل TXT",
+        data=(st.session_state[OUT_KEY] or "").encode("utf-8"),
         file_name=f"output-{now}.txt",
         mime="text/plain; charset=utf-8",
         use_container_width=True,
@@ -494,25 +458,24 @@ st.divider()
 e1, e2 = st.columns(2)
 
 with e1:
-    if Document is None:
-        st.info("لتفعيل Word: أضف python-docx في requirements.txt (موجود عندك).")
-    else:
-        try:
-            word_bytes = export_to_word_bytes(st.session_state.out_text)
-            st.download_button(
-                "تصدير Word (.docx)",
-                data=word_bytes,
-                file_name=f"output-{now}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="btn_word",
-            )
-        except Exception as e:
-            st.error(f"فشل تصدير Word: {e}")
+    try:
+        if Document is None:
+            raise RuntimeError("python-docx غير مثبت.")
+        word_bytes = export_to_word_bytes(st.session_state[OUT_KEY])
+        st.download_button(
+            "تصدير Word (.docx)",
+            data=word_bytes,
+            file_name=f"output-{now}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key="btn_word",
+        )
+    except Exception as e:
+        st.info(f"Word غير متاح: {e}")
 
 with e2:
     try:
         assume_arabic = (direction == "بريل → عربي")
-        pdf_bytes = export_to_pdf_bytes(st.session_state.out_text, assume_arabic=assume_arabic)
+        pdf_bytes = export_to_pdf_bytes(st.session_state[OUT_KEY], assume_arabic=assume_arabic)
         st.download_button(
             "تصدير PDF (.pdf)",
             data=pdf_bytes,
@@ -523,4 +486,4 @@ with e2:
     except Exception as e:
         st.error(f"فشل تصدير PDF: {e}")
 
-st.caption("ملاحظة: إن كان PDF ممسوحًا، استخدم زر (استخراج النص من الملف) وسيتم OCR إذا كانت الحزم مثبتة.")
+st.caption("ملاحظة: إن كان PDF ممسوحًا، سيتم OCR تلقائيًا (إذا كانت الحزم مثبتة على الخادم).")
