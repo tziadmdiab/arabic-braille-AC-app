@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 import re
 import io
-import hashlib
+import unicodedata
 from datetime import datetime
+from collections import Counter, defaultdict
 
 import streamlit as st
 
@@ -11,16 +12,18 @@ import streamlit as st
 # =========================
 APP_NAME = "محوّل عربي ↔ بريل"
 APP_COMPANY = "أكاديمية الموهبة المشتركة"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.3.0"
 
 # =========================
 # Optional libraries
 # =========================
+# Word export
 try:
     from docx import Document
 except Exception:
     Document = None
 
+# PDF export
 try:
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.pagesizes import A4
@@ -32,6 +35,7 @@ except Exception:
     pdfmetrics = None
     TTFont = None
 
+# Better Arabic shaping (PDF export)
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display
@@ -39,6 +43,7 @@ except Exception:
     arabic_reshaper = None
     get_display = None
 
+# OCR
 try:
     import pytesseract
 except Exception:
@@ -49,11 +54,13 @@ try:
 except Exception:
     Image = None
 
+# PDF text extraction
 try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None
 
+# PDF rendering (for scanned PDFs -> images -> OCR)
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -61,21 +68,30 @@ except Exception:
 
 
 # =========================
-# Helpers
+# 1) Text cleanup
 # =========================
 TASHKEEL_RE = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670\u0653-\u0655]")
 
 def normalize_newlines(text: str) -> str:
-    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 def remove_tashkeel(text: str) -> str:
-    return re.sub(TASHKEEL_RE, "", text or "")
+    return re.sub(TASHKEEL_RE, "", text)
 
-def file_hash(b: bytes) -> str:
-    return hashlib.sha256(b or b"").hexdigest()
+def normalize_unicode(text: str) -> str:
+    # توحيد الرموز (علامات اقتباس ذكية، أشكال مختلفة لنفس الرمز، إلخ)
+    return unicodedata.normalize("NFKC", text)
+
+def clean_text_pipeline(text: str, keep_tashkeel: bool) -> str:
+    text = normalize_newlines(text)
+    text = normalize_unicode(text)
+    if not keep_tashkeel:
+        text = remove_tashkeel(text)
+    return text
+
 
 # =========================
-# Arabic <-> Braille maps
+# 2) Arabic <-> Braille maps
 # =========================
 NUM_SIGN = "⠼"
 
@@ -145,15 +161,94 @@ EXTRA_BR2AR = {
 ALEF_FORMS = {"ا","أ","إ","آ"}
 
 def normalize_digits_to_latin(text: str) -> str:
-    return "".join(ARABIC_DIGITS_TO_LATIN.get(ch, ch) for ch in (text or ""))
+    return "".join(ARABIC_DIGITS_TO_LATIN.get(ch, ch) for ch in text)
+
 
 # =========================
-# Conversion
+# 3) Unsupported symbols report
+# =========================
+def build_unsupported_report_ar_to_br(text: str) -> dict:
+    """
+    يرجع dict فيه:
+      - counts: Counter للرموز غير المدعومة
+      - examples: أمثلة سياقية لكل رمز
+    """
+    counts = Counter()
+    examples = defaultdict(list)
+
+    for idx, ch in enumerate(text):
+        # نسمح بالأرقام لأنها ستتعامل لاحقًا
+        if ch.isdigit():
+            continue
+        if ch in AR2BR:
+            continue
+
+        counts[ch] += 1
+        # مثال سياقي (10 أحرف قبل وبعد)
+        if len(examples[ch]) < 3:
+            start = max(0, idx - 10)
+            end = min(len(text), idx + 11)
+            examples[ch].append(text[start:end].replace("\n", "⏎"))
+
+    return {"counts": counts, "examples": examples}
+
+def build_unsupported_report_br_to_ar(text: str) -> dict:
+    counts = Counter()
+    examples = defaultdict(list)
+
+    for idx, ch in enumerate(text):
+        if ch in (" ", "\n", "\t", NUM_SIGN):
+            continue
+        # أرقام بريل معروفة:
+        if ch in BR_TO_DIGIT:
+            continue
+        # رموز معروفة:
+        if ch in BR2AR or ch in EXTRA_BR2AR or text[idx:idx+2] in ("⠦⠦", "⠴⠴"):
+            continue
+
+        counts[ch] += 1
+        if len(examples[ch]) < 3:
+            start = max(0, idx - 10)
+            end = min(len(text), idx + 11)
+            examples[ch].append(text[start:end].replace("\n", "⏎"))
+
+    return {"counts": counts, "examples": examples}
+
+def render_report_ui(report: dict, title: str):
+    counts: Counter = report["counts"]
+    examples: dict = report["examples"]
+
+    st.subheader(title)
+    if not counts:
+        st.success("✅ لا توجد رموز غير مدعومة.")
+        return
+
+    st.warning(f"⚠️ تم العثور على {len(counts)} رمز/حرف غير مدعوم. (لن نحوله إلى ؟ — سنُبقيه كما هو)")
+    # جدول صغير
+    rows = []
+    for ch, cnt in counts.most_common(50):
+        name = unicodedata.name(ch, "UNKNOWN")
+        rows.append((ch, cnt, name))
+
+    st.dataframe(rows, use_container_width=True, hide_index=True,
+                 column_config={
+                     0: st.column_config.TextColumn("الرمز"),
+                     1: st.column_config.NumberColumn("التكرار"),
+                     2: st.column_config.TextColumn("اسم Unicode"),
+                 })
+
+    st.markdown("**أمثلة سياقية (حتى 3 لكل رمز):**")
+    for ch, cnt in counts.most_common(12):
+        st.write(f"- **{ch}** (×{cnt})")
+        for ex in examples[ch]:
+            st.code(ex, language="text")
+
+
+# =========================
+# 4) Conversion engine
 # =========================
 def arabic_to_braille(text: str, keep_tashkeel: bool = False) -> str:
-    text = normalize_newlines(text)
-    if not keep_tashkeel:
-        text = remove_tashkeel(text)
+    text = clean_text_pipeline(text, keep_tashkeel=keep_tashkeel)
     text = normalize_digits_to_latin(text)
 
     out = []
@@ -161,10 +256,11 @@ def arabic_to_braille(text: str, keep_tashkeel: bool = False) -> str:
     in_number = False
 
     while i < len(text):
+        # "لا" + أشكال الألف
         if i + 1 < len(text) and text[i] == "ل" and text[i+1] in ALEF_FORMS:
             in_number = False
-            out.append(AR2BR.get("ل", "⍰"))
-            out.append(AR2BR.get(text[i+1], "⍰"))
+            out.append(AR2BR.get("ل", "ل"))            # تمرير إن لم يوجد
+            out.append(AR2BR.get(text[i+1], text[i+1]))
             i += 2
             continue
 
@@ -174,23 +270,25 @@ def arabic_to_braille(text: str, keep_tashkeel: bool = False) -> str:
             if not in_number:
                 out.append(NUM_SIGN)
                 in_number = True
-            out.append(DIGIT_TO_BR.get(ch, "⍰"))
+            out.append(DIGIT_TO_BR.get(ch, ch))
             i += 1
             continue
 
         in_number = False
-        out.append(AR2BR.get(ch, "⍰"))
+        # ✅ بدل ⍰ نمرر الحرف كما هو
+        out.append(AR2BR.get(ch, ch))
         i += 1
 
     return "".join(out)
 
 def braille_to_arabic(braille_text: str, arabic_digits: bool = True) -> str:
-    braille_text = normalize_newlines(braille_text)
+    braille_text = clean_text_pipeline(braille_text, keep_tashkeel=True)
     out = []
     i = 0
     in_number = False
 
     while i < len(braille_text):
+        # « »
         if i + 1 < len(braille_text):
             two = braille_text[i:i+2]
             if two == "⠦⠦":
@@ -219,17 +317,19 @@ def braille_to_arabic(braille_text: str, arabic_digits: bool = True) -> str:
                 continue
             in_number = False
 
-        out.append(BR2AR.get(ch, EXTRA_BR2AR.get(ch, "؟")))
+        # ✅ بدل "؟" نمرر الرمز كما هو إن لم نعرفه
+        out.append(BR2AR.get(ch, EXTRA_BR2AR.get(ch, ch)))
         i += 1
 
     return "".join(out)
 
+
 # =========================
-# PDF/TXT/OCR
+# 5) PDF/TXT/OCR helpers
 # =========================
 def pdf_text_with_pypdf(pdf_bytes: bytes) -> str:
     if PdfReader is None:
-        raise RuntimeError("pypdf غير مثبت.")
+        return ""
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = []
     for p in reader.pages:
@@ -238,67 +338,34 @@ def pdf_text_with_pypdf(pdf_bytes: bytes) -> str:
 
 def ocr_image_bytes(image_bytes: bytes, lang: str = "ara") -> str:
     if pytesseract is None or Image is None:
-        raise RuntimeError("OCR غير متاح: تأكد من تثبيت pytesseract و Pillow و tesseract-ocr.")
+        raise RuntimeError("OCR غير متاح: ثبّت pytesseract و Pillow، وعلى Streamlit Cloud أضف packages.txt لتثبيت tesseract.")
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return normalize_newlines(pytesseract.image_to_string(img, lang=lang)).strip()
 
 def pdf_ocr_with_pymupdf(pdf_bytes: bytes, lang: str = "ara", max_pages: int = 10) -> str:
     if fitz is None:
-        raise RuntimeError("PyMuPDF غير مثبت.")
+        raise RuntimeError("PDF ممسوح: PyMuPDF غير مثبت. أضف PyMuPDF إلى requirements.txt")
+    if pytesseract is None or Image is None:
+        raise RuntimeError("OCR غير متاح (pytesseract/Pillow).")
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     texts = []
     n = min(len(doc), max_pages)
     for i in range(n):
         page = doc[i]
-        pix = page.get_pixmap(dpi=220)
+        pix = page.get_pixmap(dpi=200)
         img_bytes = pix.tobytes("png")
         t = ocr_image_bytes(img_bytes, lang=lang)
         if t:
             texts.append(t)
     return "\n\n".join(texts).strip()
 
-def extract_text_from_file(name: str, data: bytes, ocr_lang: str, pdf_pages: int) -> tuple[str, str]:
-    name_l = (name or "").lower()
-
-    if name_l.endswith(".txt"):
-        try:
-            t = normalize_newlines(data.decode("utf-8", errors="replace")).strip()
-            return t, f"TXT ({len(t)} حرف)"
-        except Exception as e:
-            return "", f"TXT فشل: {e}"
-
-    if name_l.endswith((".png", ".jpg", ".jpeg")):
-        try:
-            t = ocr_image_bytes(data, lang=ocr_lang)
-            return t, f"صورة OCR ({len(t)} حرف)"
-        except Exception as e:
-            return "", f"OCR فشل: {e}"
-
-    if name_l.endswith(".pdf"):
-        # 1) try text
-        try:
-            t = pdf_text_with_pypdf(data)
-            if t.strip():
-                return t, f"PDF نصي ({len(t)} حرف)"
-        except Exception:
-            pass
-        # 2) OCR
-        try:
-            t2 = pdf_ocr_with_pymupdf(data, lang=ocr_lang, max_pages=pdf_pages)
-            if t2.strip():
-                return t2, f"PDF OCR ({len(t2)} حرف)"
-            return "", "PDF OCR: لم يرجع نصًا"
-        except Exception as e:
-            return "", f"PDF OCR فشل: {e}"
-
-    return "", "نوع ملف غير مدعوم"
 
 # =========================
-# Export
+# 6) Export helpers
 # =========================
 def export_to_word_bytes(text: str) -> bytes:
     if Document is None:
-        raise RuntimeError("python-docx غير مثبت.")
+        raise RuntimeError("تصدير Word غير متاح: أضف python-docx إلى requirements.txt")
     doc = Document()
     for line in normalize_newlines(text).split("\n"):
         doc.add_paragraph(line)
@@ -313,7 +380,8 @@ def _shape_arabic(text: str) -> str:
 
 def export_to_pdf_bytes(text: str, assume_arabic: bool = True) -> bytes:
     if rl_canvas is None or A4 is None:
-        raise RuntimeError("reportlab غير مثبت.")
+        raise RuntimeError("تصدير PDF غير متاح: أضف reportlab إلى requirements.txt")
+
     buf = io.BytesIO()
     c = rl_canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -322,10 +390,11 @@ def export_to_pdf_bytes(text: str, assume_arabic: bool = True) -> bytes:
 
     font_name = "Helvetica"
     if pdfmetrics and TTFont:
-        for fp in [
+        candidates = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
-        ]:
+        ]
+        for fp in candidates:
             try:
                 pdfmetrics.registerFont(TTFont("DejaVuSans", fp))
                 font_name = "DejaVuSans"
@@ -334,6 +403,7 @@ def export_to_pdf_bytes(text: str, assume_arabic: bool = True) -> bytes:
                 pass
 
     c.setFont(font_name, 12)
+
     for line in normalize_newlines(text).split("\n"):
         if y < margin:
             c.showPage()
@@ -342,111 +412,143 @@ def export_to_pdf_bytes(text: str, assume_arabic: bool = True) -> bytes:
         draw_line = _shape_arabic(line) if assume_arabic else line
         c.drawString(margin, y, draw_line)
         y -= 18
+
     c.save()
     return buf.getvalue()
 
+
 # =========================
-# Streamlit UI
+# 7) Streamlit UI
 # =========================
 st.set_page_config(page_title=APP_NAME, layout="wide")
 
-# keys for widgets
-IN_KEY = "in_text_area"
-OUT_KEY = "out_text_area"
-
-# defaults
-st.session_state.setdefault(IN_KEY, "")
-st.session_state.setdefault(OUT_KEY, "")
-st.session_state.setdefault("last_upload_hash", "")
+# Session state defaults
+if "in_text" not in st.session_state:
+    st.session_state.in_text = ""
+if "out_text" not in st.session_state:
+    st.session_state.out_text = ""
 
 st.title(APP_NAME)
 st.caption(f"الجهة: {APP_COMPANY} — الإصدار {APP_VERSION}")
 
 with st.sidebar:
     st.header("الإعدادات")
+
     direction = st.radio("الاتجاه", ["عربي → بريل", "بريل → عربي"], index=0, key="dir_radio")
-    keep_tashkeel = st.checkbox("عدم حذف التشكيل (قد يظهر ⍰ لبعض الحركات)", value=False, key="keep_tashkeel")
+
+    keep_tashkeel = st.checkbox("عدم حذف التشكيل (قد يؤثر على بعض النتائج)", value=False, key="keep_tashkeel")
     arabic_digits_out = st.checkbox("عند (بريل → عربي) استخدم الأرقام العربية ٠١٢٣…", value=True, key="arabic_digits_out")
 
     st.divider()
-    uploaded = st.file_uploader(
-        "رفع ملف (TXT / PDF / صورة)",
-        type=["txt", "pdf", "png", "jpg", "jpeg"],
-        key="uploader_main",
-    )
+    st.subheader("رفع ملف")
+    uploaded = st.file_uploader("ارفع TXT أو PDF أو صورة", type=["txt", "pdf", "png", "jpg", "jpeg"], key="uploader_main")
 
-    st.subheader("خيارات PDF/OCR")
-    ocr_lang = st.selectbox("لغة OCR", ["ara", "eng"], index=0, key="ocr_lang")
-    pdf_pages = st.slider("عدد صفحات OCR للـ PDF الممسوح", 1, 30, 10, key="pdf_pages")
+    st.subheader("خيارات بعد الرفع")
     auto_convert = st.checkbox("تحويل تلقائي بعد الرفع", value=True, key="auto_convert")
+    ocr_lang = st.selectbox("لغة OCR", ["ara", "eng"], index=0, key="ocr_lang")
+    pdf_ocr_pages = st.slider("عدد صفحات OCR (للـ PDF الممسوح)", 1, 30, 10, key="pdf_ocr_pages")
+
+    st.divider()
+    st.subheader("التصدير")
+    want_word = st.checkbox("إظهار زر Word", value=True, key="want_word")
+    want_pdf = st.checkbox("إظهار زر PDF", value=True, key="want_pdf")
+
+    st.divider()
+    st.subheader("تقرير الرموز غير المدعومة")
+    show_report = st.checkbox("إظهار التقرير", value=True, key="show_report")
+
 
 def do_convert(src: str) -> str:
     if direction == "عربي → بريل":
         return arabic_to_braille(src, keep_tashkeel=keep_tashkeel)
     return braille_to_arabic(src, arabic_digits=arabic_digits_out)
 
-# ✅ استخراج تلقائي فور الرفع + تعبئة مربع النص مباشرة
+
+# ===== Handle uploads =====
 if uploaded is not None:
-    name = uploaded.name or ""
-    data = uploaded.getvalue() or b""
-    h = file_hash(data)
+    name = (uploaded.name or "").lower()
+    data = uploaded.getvalue()
 
-    # فقط إذا الملف جديد (عشان لا يعيد الاستخراج كل rerun)
-    if h != st.session_state["last_upload_hash"]:
-        text, note = extract_text_from_file(name, data, ocr_lang, pdf_pages)
-        if text.strip():
-            st.session_state[IN_KEY] = text
-            if auto_convert:
-                st.session_state[OUT_KEY] = do_convert(text)
-            st.sidebar.success(f"تمت القراءة: {note}")
+    if name.endswith(".txt"):
+        st.session_state.in_text = normalize_newlines(data.decode("utf-8", errors="replace"))
+        st.sidebar.success("تم تحميل TXT.")
+
+    elif name.endswith((".png", ".jpg", ".jpeg")):
+        try:
+            st.session_state.in_text = ocr_image_bytes(data, lang=ocr_lang)
+            st.sidebar.success("تم استخراج النص من الصورة (OCR).")
+        except Exception as e:
+            st.sidebar.error(str(e))
+
+    elif name.endswith(".pdf"):
+        text = ""
+        try:
+            text = pdf_text_with_pypdf(data)
+        except Exception:
+            text = ""
+
+        if text:
+            st.session_state.in_text = text
+            st.sidebar.success("تم استخراج نص PDF (نصي).")
         else:
-            st.sidebar.error(f"فشل استخراج النص: {note}")
+            st.sidebar.warning("PDF يبدو ممسوحًا/صور. محاولة OCR...")
+            try:
+                ocr_text = pdf_ocr_with_pymupdf(data, lang=ocr_lang, max_pages=pdf_ocr_pages)
+                if ocr_text:
+                    st.session_state.in_text = ocr_text
+                    st.sidebar.success("نجح OCR لصفحات PDF.")
+                else:
+                    st.sidebar.error("OCR لم يستخرج نصًا (قد تكون جودة المسح ضعيفة).")
+            except Exception as e:
+                st.sidebar.error(str(e))
 
-        st.session_state["last_upload_hash"] = h
+    if auto_convert:
+        st.session_state.out_text = do_convert(st.session_state.in_text)
+
 
 # ===== Main UI =====
 col1, col2 = st.columns(2, gap="large")
 
 with col1:
     st.subheader("النص الأصلي")
-    st.text_area(
+    st.session_state.in_text = st.text_area(
         label="النص الأصلي",
-        key=IN_KEY,
+        value=st.session_state.in_text,
         height=420,
+        key="in_text_area",
         label_visibility="collapsed",
-        placeholder="ارفع ملف ليتم إدخال النص هنا تلقائيًا… أو اكتب/الصق النص يدويًا",
     )
 
 with col2:
     st.subheader("الناتج")
-    st.text_area(
+    st.session_state.out_text = st.text_area(
         label="الناتج",
-        key=OUT_KEY,
+        value=st.session_state.out_text,
         height=420,
+        key="out_text_area",
         label_visibility="collapsed",
-        placeholder="سيظهر الناتج هنا بعد التحويل",
     )
 
 b1, b2, b3, b4 = st.columns([1, 1, 1, 1], gap="small")
 
 with b1:
     if st.button("تحويل الآن", use_container_width=True, key="btn_convert"):
-        st.session_state[OUT_KEY] = do_convert(st.session_state[IN_KEY])
+        st.session_state.out_text = do_convert(st.session_state.in_text)
 
 with b2:
     if st.button("تبديل (Swap)", use_container_width=True, key="btn_swap"):
-        st.session_state[IN_KEY], st.session_state[OUT_KEY] = st.session_state[OUT_KEY], st.session_state[IN_KEY]
+        st.session_state.in_text, st.session_state.out_text = st.session_state.out_text, st.session_state.in_text
 
 with b3:
     if st.button("مسح الكل", use_container_width=True, key="btn_clear"):
-        st.session_state[IN_KEY] = ""
-        st.session_state[OUT_KEY] = ""
+        st.session_state.in_text = ""
+        st.session_state.out_text = ""
 
 with b4:
     now = datetime.now().strftime("%Y%m%d-%H%M%S")
     st.download_button(
-        "تحميل TXT",
-        data=(st.session_state[OUT_KEY] or "").encode("utf-8"),
+        "تحميل الناتج TXT",
+        data=st.session_state.out_text.encode("utf-8"),
         file_name=f"output-{now}.txt",
         mime="text/plain; charset=utf-8",
         use_container_width=True,
@@ -455,35 +557,50 @@ with b4:
 
 st.divider()
 
+# ===== Export buttons =====
 e1, e2 = st.columns(2)
 
 with e1:
-    try:
+    if want_word:
         if Document is None:
-            raise RuntimeError("python-docx غير مثبت.")
-        word_bytes = export_to_word_bytes(st.session_state[OUT_KEY])
-        st.download_button(
-            "تصدير Word (.docx)",
-            data=word_bytes,
-            file_name=f"output-{now}.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            key="btn_word",
-        )
-    except Exception as e:
-        st.info(f"Word غير متاح: {e}")
+            st.warning("Word غير متاح (python-docx غير مثبت).")
+        else:
+            try:
+                word_bytes = export_to_word_bytes(st.session_state.out_text)
+                st.download_button(
+                    "تصدير Word (.docx)",
+                    data=word_bytes,
+                    file_name=f"output-{now}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="btn_word",
+                )
+            except Exception as e:
+                st.error(f"فشل تصدير Word: {e}")
 
 with e2:
-    try:
+    if want_pdf:
         assume_arabic = (direction == "بريل → عربي")
-        pdf_bytes = export_to_pdf_bytes(st.session_state[OUT_KEY], assume_arabic=assume_arabic)
-        st.download_button(
-            "تصدير PDF (.pdf)",
-            data=pdf_bytes,
-            file_name=f"output-{now}.pdf",
-            mime="application/pdf",
-            key="btn_pdf",
-        )
-    except Exception as e:
-        st.error(f"فشل تصدير PDF: {e}")
+        try:
+            pdf_bytes = export_to_pdf_bytes(st.session_state.out_text, assume_arabic=assume_arabic)
+            st.download_button(
+                "تصدير PDF (.pdf)",
+                data=pdf_bytes,
+                file_name=f"output-{now}.pdf",
+                mime="application/pdf",
+                key="btn_pdf",
+            )
+        except Exception as e:
+            st.error(f"فشل تصدير PDF: {e}")
 
-st.caption("ملاحظة: إن كان PDF ممسوحًا، سيتم OCR تلقائيًا (إذا كانت الحزم مثبتة على الخادم).")
+
+# ===== Report section =====
+if show_report:
+    st.divider()
+    if direction == "عربي → بريل":
+        rpt = build_unsupported_report_ar_to_br(clean_text_pipeline(st.session_state.in_text, keep_tashkeel=keep_tashkeel))
+        render_report_ui(rpt, "تقرير: رموز غير مدعومة (عربي → بريل)")
+    else:
+        rpt = build_unsupported_report_br_to_ar(clean_text_pipeline(st.session_state.in_text, keep_tashkeel=True))
+        render_report_ui(rpt, "تقرير: رموز غير مدعومة (بريل → عربي)")
+
+st.caption("ملاحظة: التحويل تعليمي وقد لا يطابق معيار بريل العربي حرفيًا في جميع حالات الاختصارات والترقيم.")
